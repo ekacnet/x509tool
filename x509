@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+
+from typing import Tuple, Optional, List, Union
+from enum import IntEnum
+from cryptography.hazmat.backends import default_backend
+from cryptography.x509.general_name import (
+    OtherName,
+    RFC822Name,
+    DNSName,
+    UniformResourceIdentifier,
+    DirectoryName,
+    RegisteredID,
+    IPAddress,
+)
+from cryptography import x509
+from datetime import datetime
+
+import os
+import time
+import click
+import re
+import sys
+import cryptography
+
+
+class InputType(IntEnum):
+    FILEPATH = 1
+    SERVER = 2
+    DEVICE = 3
+
+
+class FrontColor(IntEnum):
+    BLACK = 30
+    RED = 31
+    GREEN = 32
+    ORANGE = 33
+    BLUE = 34
+    MAGENTA = 35
+    CYAN = 36
+    WHITE = 37
+
+
+def colorize(text: str, color: FrontColor, bright: bool = False) -> str:
+    if not sys.stdout.isatty():
+        return text
+    else:
+        if bright:
+            offset = 60
+        else:
+            offset = 0
+        return f"\033[{int(color) + offset}m{text}\033[0m"
+
+
+# Addtional padding to add to fields names when displaying
+ADDITIONAL_PADDING = 5
+HOST_PREFIX = "host://"
+HTTP_PREFIX = "http://"
+END_CERT_DELIM = b"-----END CERTIFICATE-----"
+
+# key usage could have the following attributes
+USAGE_ATTRIBUTES = [
+    "digital_signature",
+    "content_commitment",
+    "key_encipherment",
+    "data_encipherment",
+    "key_agreement",
+    "key_cert_sign",
+    "crl_sign",
+]
+
+
+def guess_type_from_name(input_name: str) -> Tuple[InputType, str]:
+    if input_name.startswith("/dev/"):
+        return (InputType.DEVICE, input_name)
+
+    # Absolute path
+    if input_name.startswith("/"):
+        return (InputType.FILEPATH, input_name)
+
+    # Relative path
+    if re.match(r"^\.{1,2}/", input_name):
+        return (InputType.FILEPATH, input_name)
+
+    if input_name.startswith(HOST_PREFIX):
+        return (InputType.SERVER, input_name[len(HOST_PREFIX) :])
+
+    if input_name.startswith(HTTP_PREFIX):
+        return (InputType.SERVER, input_name[len(HTTP_PREFIX) :])
+
+    if re.match(r"[\w\.]+:\d+", input_name):
+        return (InputType.SERVER, input_name)
+
+    return (InputType.FILEPATH, input_name)
+
+
+class InputData:
+    type: InputType
+    input_name: str
+
+    def __init__(self, name: str):
+        (self.type, self.input_name) = guess_type_from_name(name)
+
+    def __str__(self):
+        if self.type == InputType.FILEPATH:
+            return f"file {self.input_name}"
+
+        if self.type == InputType.DEVICE:
+            return f"device {self.input_name}"
+
+    def get_pem(self):
+        if self.type == InputType.FILEPATH or self.type == InputType.DEVICE:
+            return self._get_pem_from_file()
+
+        if self.type == InputType.SERVER:
+            print("Warning: server type input not yet supported")
+            return None
+
+    def _get_pem_from_file(self) -> Optional[bytes]:
+        try:
+            with open(self.input_name, "rb") as fd:
+                pem_data = fd.read()
+        except FileNotFoundError as e:
+            print(f"Can't open {self} to read PEM encoded data")
+            return None
+
+        return pem_data
+
+
+def validity_to_text(valid: bool) -> str:
+    if valid:
+        return colorize("valid", FrontColor.GREEN)
+    else:
+        return colorize("expired", FrontColor.RED)
+
+
+def get_expiration(nb_sec: int) -> Tuple[int, str]:
+    val = abs(nb_sec)
+    if nb_sec < 0:
+        sign = -1
+    else:
+        sign = 1
+
+    if val < 60:
+        return (sign * val, "seconds")
+
+    if val < 3600:
+        return (sign * int(val / 60), "minutes")
+
+    if val < 86400:
+        return (sign * int(val / 3600), "hours")
+
+    # Rounds months to 30 days ...
+    if val < 30 * 86400:
+        return (sign * int(val / 86400), "days")
+
+    if val < 365 * 86400:
+        return (sign * int(val / (30 * 86400)), "months")
+
+    return (sign * int(val / (365 * 86400)), "years")
+
+
+def is_cert_valid(start: datetime, end: datetime) -> Tuple[bool, int]:
+    # start and end date in certicate are in PST
+    now = datetime.utcnow()
+    return (now <= end and now >= start, int((end - now).total_seconds()))
+
+
+def get_cn(subject: x509.Name) -> Tuple[str, Optional[str]]:
+    attrs = subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+    if len(attrs) == 0:
+        return ("", "Certificate is missing CN attribute")
+    if len(attrs) > 1:
+        return ("", "Certificate has too many CN attributes")
+
+    return (attrs[0].value, None)
+
+
+def usage_attr_to_string(attr: str) -> str:
+    return " ".join([w for w in attr.split("_")])
+
+
+def beautify_usage_name(name: str) -> str:
+    val = name
+    if val.startswith("key "):
+        val = val[4:]
+    if val.endswith("sign"):
+        val = f"{val}ing"
+
+    val = re.sub(r"(?<! )([A-Z][a-z0-9]+)", lambda x: f" {x.group(1).lower()}", val)
+
+    val = val.capitalize()
+    val = re.sub(r"crl ", "CRL ", val, flags=re.I)
+    return val
+
+
+def get_key_usage(
+    extensions: x509.extensions.Extensions
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    try:
+        usage = extensions.get_extension_for_oid(x509.ExtensionOID.KEY_USAGE)
+    except x509.extensions.ExtensionNotFound:
+        return (None, "No key usages found")
+
+    try:
+        ext_usage = extensions.get_extension_for_oid(
+            x509.ExtensionOID.EXTENDED_KEY_USAGE
+        )
+    except x509.extensions.ExtensionNotFound:
+        ext_usage = None
+
+    ret = []
+    for attr in USAGE_ATTRIBUTES:
+        if getattr(usage.value, attr):
+            ret.append(usage_attr_to_string(attr))
+
+    if ext_usage is not None:
+        ret.extend([e._name for e in ext_usage.value._usages])
+
+    return ([beautify_usage_name(e) for e in ret], None)
+
+
+def get_ca_issuers(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+    return get_ad(extensions, x509.AuthorityInformationAccessOID.CA_ISSUERS)
+
+
+def get_ocsp(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+    return get_ad(extensions, x509.AuthorityInformationAccessOID.OCSP)
+
+
+def get_ad(
+    extensions: x509.extensions.Extensions, oid: x509.oid.AuthorityInformationAccessOID
+) -> Optional[List[str]]:
+    try:
+        authority_info_access = extensions.get_extension_for_oid(
+            x509.ExtensionOID.AUTHORITY_INFORMATION_ACCESS
+        )
+    except x509.extensions.ExtensionNotFound:
+        return None
+
+    ret = []
+    for access_description in authority_info_access.value._descriptions:
+        if access_description._access_method == oid:
+            ret.append(access_description._access_location.value)
+
+    if len(ret) > 0:
+        return ret
+
+    return None
+
+
+def get_crl(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+    try:
+        crl = extensions.get_extension_for_oid(
+            x509.ExtensionOID.CRL_DISTRIBUTION_POINTS
+        )
+    except x509.extensions.ExtensionNotFound:
+        return None
+
+    ret = []
+    for dp in crl.value._distribution_points:
+        for v in dp._full_name:
+            ret.append(v.value)
+
+    return ret
+
+
+def get_san(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+    try:
+        san = extensions.get_extension_for_oid(
+            x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+        )
+    except x509.extensions.ExtensionNotFound:
+        return None
+
+    ret = []
+
+    for (prefix, type) in [
+        ("other", OtherName),
+        ("mail", RFC822Name),
+        ("dns", DNSName),
+        ("uri", UniformResourceIdentifier),
+        ("directory", DirectoryName),
+        ("registeredID", RegisteredID),
+        ("ip", IPAddress),
+    ]:
+        for v in san.value.get_values_for_type(type):
+            if isinstance(v, x509.name.Name):
+                v = v.rfc4514_string()
+
+            if isinstance(v, IPAddress):
+                v = format(v.value)
+
+            ret.append(f"{prefix}:{v}")
+
+    return ret
+
+
+def gen_key_info(pubkey) -> str:
+    if isinstance(pubkey, cryptography.hazmat.primitives.asymmetric.rsa.RSAPublicKey):
+        return f"RSA {pubkey.key_size}"
+
+    if isinstance(pubkey, cryptography.hazmat.primitives.asymmetric.dsa.DSAPublicKey):
+        return f"DSA {pubkey.key_size}"
+
+    if isinstance(
+        pubkey, cryptography.hazmat.primitives.asymmetric.ec.EllipticCurvePublicKey
+    ):
+        return f"EC {pubkey.curve.name}"
+
+    if isinstance(
+        pubkey, cryptography.hazmat.primitives.asymmetric.ed25519.Ed25519PublicKey
+    ):
+        return "ED25519"
+
+    if isinstance(
+        pubkey, cryptography.hazmat.primitives.asymmetric.ed448.Ed448PublicKey
+    ):
+        return "ED448"
+
+    return "unknown"
+
+
+def get_cert_type(cert: x509.Certificate) -> Optional[str]:
+
+    # TODO implement it
+    return None
+
+
+def get_skid(extensions: x509.extensions.Extensions) -> Optional[str]:
+
+    return get_keyid_for_oid(extensions, x509.ExtensionOID.SUBJECT_KEY_IDENTIFIER)
+
+
+def format_keyid(value: bytes) -> str:
+    return "keyid:{}".format("".join("{:02x}".format(b) for b in value))
+
+
+def get_akid(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+
+    oid = x509.ExtensionOID.AUTHORITY_KEY_IDENTIFIER
+    try:
+        key = extensions.get_extension_for_oid(oid)
+    except x509.extensions.ExtensionNotFound:
+        return None
+
+    ret = []
+
+    if key.value.key_identifier is not None:
+        ret.append(format_keyid(key.value.key_identifier))
+
+    if key.value.authority_cert_issuer is not None:
+        ret.append(
+            "dirname:{}".format(
+                ", ".join(
+                    [e.value.rfc4514_string() for e in key.value.authority_cert_issuer]
+                )
+            )
+        )
+
+    if key.value.authority_cert_serial_number is not None:
+        ret.append(f"serial:{key.value.authority_cert_serial_number}")
+
+    if len(ret) > 0:
+        return ret
+    else:
+        return None
+
+
+def get_keyid_for_oid(
+    extensions: x509.extensions.Extensions, oid: x509.ObjectIdentifier
+) -> Optional[str]:
+
+    try:
+        keyid = extensions.get_extension_for_oid(oid)
+    except x509.extensions.ExtensionNotFound:
+        return None
+
+    return format_keyid(keyid.value.digest)
+
+
+def format_and_print_fields(fields: List[Tuple[str, Union[str, List[str]]]]):
+    len_longuest_field_name = max([len(v[0]) for v in fields])
+    padding = len_longuest_field_name + ADDITIONAL_PADDING
+    for field in fields:
+        name = f"{field[0]}:"
+        if isinstance(field[1], list):
+            if len(field[1]) > 0:
+                print(f"{name.ljust(padding)}{field[1][0]}")
+                for e in field[1][1:]:
+                    print(
+                        f"{' '.ljust(len_longuest_field_name + ADDITIONAL_PADDING)}{e}"
+                    )
+        else:
+            print(f"{name.ljust(padding)}{field[1]}")
+
+
+def print_cert(cert: x509.Certificate, timezone="GMT"):
+    fields: List[Tuple[str, Union[str, List[str]]]] = []
+    (valid, nb_sec_to_expiration) = is_cert_valid(
+        cert.not_valid_before, cert.not_valid_after
+    )
+    (value, label) = get_expiration(nb_sec_to_expiration)
+    # type of the cert
+    # SAN
+    # additional identity
+    # CN
+    # Issuer
+    # validity
+    # Serial
+    # Usage
+    # CRL
+    # OSCP
+    # Ciphers
+    # SKID
+    # AKID
+    warnings = []
+
+    cert_type = get_cert_type(cert)
+
+    # TODO use full subject if there isn't a CN
+    (cn, warn) = get_cn(cert.subject)
+    warnings.append(warn)
+
+    (usages, warn) = get_key_usage(cert.extensions)
+    warnings.append(warn)
+
+    crl = get_crl(cert.extensions)
+
+    ocsp = get_ocsp(cert.extensions)
+
+    ca_issuers = get_ca_issuers(cert.extensions)
+
+    san = get_san(cert.extensions)
+
+    signature = cert.signature_hash_algorithm
+
+    pubkey = cert.public_key()
+    key_info = gen_key_info(pubkey)
+
+    if signature is not None:
+        key_info = f"{key_info} / {signature.name}"
+
+    if cert_type is not None:
+        fields.append(("Type", cert_type))
+
+    skid = get_skid(cert.extensions)
+    akid = get_akid(cert.extensions)
+
+    fields.append(("CN", colorize(cn, FrontColor.BLUE)))
+    if san is not None:
+        fields.append(("SAN", san))
+    fields.append(("Issuer", f"{cert.issuer.rfc4514_string()}"))
+    fields.append(
+        (
+            "Validity",
+            f"{validity_to_text(valid)} / {cert.not_valid_before} {timezone} to {cert.not_valid_after} {timezone} ({value} {label} to expiration)",
+        )
+    )
+    fields.append(("Serial", f"{cert.serial_number}"))
+    if usages is not None:
+        fields.append(("Usage", f'{", ".join(usages)}'))
+    if crl is not None:
+        fields.append(("Crl", f'{", ".join(crl)}'))
+
+    if ca_issuers is not None:
+        fields.append(("CA issuers", f'{", ".join(ca_issuers)}'))
+
+    if ocsp is not None:
+        fields.append(("OSCP", f'{", ".join(ocsp)}'))
+
+    fields.append(("Ciphers", key_info))
+
+    if skid is not None:
+        fields.append(("SKID", skid))
+
+    if akid is not None:
+        fields.append(("AKID", akid))
+
+    # Format the fields
+    format_and_print_fields(fields)
+
+    warnings = list(filter(lambda x: x is not None, warnings))
+    if len(warnings) != 0:
+        print("\nParsing of certificate generated the following warnings:")
+        for w in warnings:
+            print(f"  {w}")
+
+
+@click.command()
+@click.option("--verbose", help="verbose info")
+@click.argument("input_name", default="/dev/stdin")
+def process(verbose, input_name) -> int:
+    input = InputData(input_name)
+    pem_data = input.get_pem()
+
+    if pem_data is None:
+        sys.exit(-1)
+    certs = pem_data.split(END_CERT_DELIM)
+    certs = [c + END_CERT_DELIM for c in certs if len(c.strip(b"\r\n")) > 0]
+    for pem_cert in certs:
+        try:
+            cert = x509.load_pem_x509_certificate(pem_cert, default_backend())
+        except ValueError as e:
+            print(f"Content of {input} is not a valid PEM encoded certificate")
+            sys.exit(-2)
+
+        print_cert(cert)
+        if len(certs) > 1:
+            print("-----")
+
+    return 0
+
+
+if __name__ == "__main__":
+    process()
