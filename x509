@@ -16,6 +16,7 @@ from cryptography import x509
 from datetime import datetime
 
 import os
+import ssl
 import time
 import click
 import re
@@ -54,7 +55,7 @@ def colorize(text: str, color: FrontColor, bright: bool = False) -> str:
 # Addtional padding to add to fields names when displaying
 ADDITIONAL_PADDING = 5
 HOST_PREFIX = "host://"
-HTTP_PREFIX = "http://"
+HTTP_PREFIX = "https://"
 END_CERT_DELIM = b"-----END CERTIFICATE-----"
 
 # key usage could have the following attributes
@@ -107,13 +108,25 @@ class InputData:
         if self.type == InputType.DEVICE:
             return f"device {self.input_name}"
 
+        if self.type == InputType.SERVER:
+            return f"host {self.input_name}"
+
     def get_pem(self):
         if self.type == InputType.FILEPATH or self.type == InputType.DEVICE:
             return self._get_pem_from_file()
 
         if self.type == InputType.SERVER:
-            print("Warning: server type input not yet supported")
-            return None
+            return self._get_pem_from_server()
+
+    def _get_pem_from_server(self) -> Optional[bytes]:
+        s = self.input_name.split(':')
+        server = s[0]
+        if len(s) > 1:
+            port = int(s[1])
+        else:
+            port = 443
+        return str.encode(ssl.get_server_certificate((server, port)))
+
 
     def _get_pem_from_file(self) -> Optional[bytes]:
         try:
