@@ -22,6 +22,11 @@ import click
 import re
 import sys
 import cryptography
+import socket
+
+from OpenSSL.crypto import FILETYPE_PEM, dump_certificate
+
+from OpenSSL import SSL
 
 
 class InputType(IntEnum):
@@ -118,6 +123,32 @@ class InputData:
         if self.type == InputType.SERVER:
             return self._get_pem_from_server()
 
+    def _ssl_wrap_socket(self, sock, keyfile=None, certfile=None, cert_reqs=None,
+                        ca_certs=None, server_hostname=None,
+                        ssl_version=None):
+        context = SSL.Context(ssl_version)
+        context.verify_mode = cert_reqs
+        if ca_certs:
+            try:
+                context.load_verify_locations(ca_certs)
+            except Exception as e:  # Reraise as SSLError
+                raise SSLError(e)
+
+        if certfile:
+            # FIXME: This block needs a test.
+            context.load_cert_chain(certfile, keyfile)
+        connection = SSL.Connection(context, sock)
+        if server_hostname:
+            connection.set_tlsext_host_name(server_hostname.encode("idna"))
+        connection.set_connect_state()
+        try:
+            connection.do_handshake()
+        except SSL.Error as v:
+            raise exceptions.TlsException("SSL handshake error: %s" % repr(v))
+
+
+        return (context, connection)
+
     def _get_pem_from_server(self) -> Optional[bytes]:
         s = self.input_name.split(':')
         server = s[0]
@@ -125,7 +156,15 @@ class InputData:
             port = int(s[1])
         else:
             port = 443
-        return str.encode(ssl.get_server_certificate((server, port)))
+
+        skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        skt.connect((server, port))
+
+        (context, ssl_socket) = self._ssl_wrap_socket(skt, cert_reqs=0, server_hostname=server,
+                                                      ssl_version=SSL.TLS_METHOD)
+
+        return "".join([dump_certificate(FILETYPE_PEM, c).decode() for c in
+                          ssl_socket.get_peer_cert_chain()]).encode()
 
 
     def _get_pem_from_file(self) -> Optional[bytes]:
