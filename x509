@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 
+import re
+import sys
+import socket
+import ssl
+from datetime import datetime
 from typing import Tuple, Optional, List, Union
 from enum import IntEnum
+
+import click
+import cryptography
+
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509.general_name import (
     OtherName,
@@ -13,16 +22,7 @@ from cryptography.x509.general_name import (
     IPAddress,
 )
 from cryptography import x509
-from datetime import datetime
 
-import os
-import ssl
-import time
-import click
-import re
-import sys
-import cryptography
-import socket
 
 from OpenSSL.crypto import FILETYPE_PEM, dump_certificate
 
@@ -76,16 +76,13 @@ USAGE_ATTRIBUTES = [
 
 
 def guess_type_from_name(input_name: str) -> Tuple[InputType, str]:
-    if input_name.startswith("/dev/"):
+    """Try infer the type of input from the name of it"""
+    if (
+        input_name.startswith("/dev/")
+        or input_name.startswith("/")
+        or re.match(r"^\.{1,2}/", input_name)
+    ):
         return (InputType.DEVICE, input_name)
-
-    # Absolute path
-    if input_name.startswith("/"):
-        return (InputType.FILEPATH, input_name)
-
-    # Relative path
-    if re.match(r"^\.{1,2}/", input_name):
-        return (InputType.FILEPATH, input_name)
 
     if input_name.startswith(HOST_PREFIX):
         return (InputType.SERVER, input_name[len(HOST_PREFIX) :])
@@ -100,6 +97,8 @@ def guess_type_from_name(input_name: str) -> Tuple[InputType, str]:
 
 
 class InputData:
+    """Modelize the x509 input data"""
+
     type: InputType
     input_name: str
 
@@ -116,41 +115,51 @@ class InputData:
         if self.type == InputType.SERVER:
             return f"host {self.input_name}"
 
+        return f"UNKNOWN {self.input_name}"
+
     def get_pem(self):
-        if self.type == InputType.FILEPATH or self.type == InputType.DEVICE:
+        """Get the certificate for the input data"""
+        if self.type in (InputType.FILEPATH, InputType.DEVICE):
             return self._get_pem_from_file()
 
         if self.type == InputType.SERVER:
             return self._get_pem_from_server()
 
-    def _ssl_wrap_socket(self, sock, keyfile=None, certfile=None, cert_reqs=None,
-                        ca_certs=None, server_hostname=None,
-                        ssl_version=None):
-        context = SSL.Context(ssl_version)
-        context.verify_mode = cert_reqs
-        if ca_certs:
-            try:
-                context.load_verify_locations(ca_certs)
-            except Exception as e:  # Reraise as SSLError
-                raise SSLError(e)
-
-        if certfile:
-            # FIXME: This block needs a test.
-            context.load_cert_chain(certfile, keyfile)
-        connection = SSL.Connection(context, sock)
-        if server_hostname:
-            connection.set_tlsext_host_name(server_hostname.encode("idna"))
-        connection.set_connect_state()
-        try:
-            connection.do_handshake()
-        except SSL.Error as v:
-            raise exceptions.TlsException("SSL handshake error: %s" % repr(v))
-
-
-        return (context, connection)
+        return None
 
     def _get_pem_from_server(self) -> Optional[bytes]:
-        s = self.input_name.split(':')
+        def _ssl_wrap_socket(
+            sock,
+            keyfile=None,
+            certfile=None,
+            cert_reqs=None,
+            ca_certs=None,
+            server_hostname=None,
+            ssl_version=None,
+        ):
+            context = SSL.Context(ssl_version)
+            context.verify_mode = cert_reqs
+            if ca_certs:
+                try:
+                    context.load_verify_locations(ca_certs)
+                except Exception as e:  # Reraise as SSLError
+                    raise ssl.SSLError(e)
+
+            if certfile:
+                context.load_cert_chain(certfile, keyfile)
+            connection = SSL.Connection(context, sock)
+            print(server_hostname)
+            if server_hostname:
+                connection.set_tlsext_host_name(server_hostname.encode("idna"))
+            connection.set_connect_state()
+            try:
+                connection.do_handshake()
+            except SSL.Error as v:
+                raise SSL.Error(f"SSL handshake error: {v}")
+
+            return (context, connection)
+
+        s = self.input_name.split(":")
         server = s[0]
         if len(s) > 1:
             port = int(s[1])
@@ -160,18 +169,22 @@ class InputData:
         skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         skt.connect((server, port))
 
-        (context, ssl_socket) = self._ssl_wrap_socket(skt, cert_reqs=0, server_hostname=server,
-                                                      ssl_version=SSL.TLS_METHOD)
+        (_context, ssl_socket) = _ssl_wrap_socket(
+            skt, cert_reqs=0, server_hostname=server, ssl_version=SSL.TLS_METHOD
+        )
 
-        return "".join([dump_certificate(FILETYPE_PEM, c).decode() for c in
-                          ssl_socket.get_peer_cert_chain()]).encode()
-
+        return "".join(
+            [
+                dump_certificate(FILETYPE_PEM, c).decode()
+                for c in ssl_socket.get_peer_cert_chain()
+            ]
+        ).encode()
 
     def _get_pem_from_file(self) -> Optional[bytes]:
         try:
             with open(self.input_name, "rb") as fd:
                 pem_data = fd.read()
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             print(f"Can't open {self} to read PEM encoded data")
             return None
 
@@ -214,7 +227,7 @@ def get_expiration(nb_sec: int) -> Tuple[int, str]:
 def is_cert_valid(start: datetime, end: datetime) -> Tuple[bool, int]:
     # start and end date in certicate are in PST
     now = datetime.utcnow()
-    return (now <= end and now >= start, int((end - now).total_seconds()))
+    return (start <= now <= end, int((end - now).total_seconds()))
 
 
 def get_cn(subject: x509.Name) -> Tuple[str, Optional[str]]:
@@ -228,7 +241,7 @@ def get_cn(subject: x509.Name) -> Tuple[str, Optional[str]]:
 
 
 def usage_attr_to_string(attr: str) -> str:
-    return " ".join([w for w in attr.split("_")])
+    return " ".join(list(attr.split("_")))
 
 
 def beautify_usage_name(name: str) -> str:
@@ -246,7 +259,7 @@ def beautify_usage_name(name: str) -> str:
 
 
 def get_key_usage(
-    extensions: x509.extensions.Extensions
+    extensions: x509.extensions.Extensions,
 ) -> Tuple[Optional[List[str]], Optional[str]]:
     try:
         usage = extensions.get_extension_for_oid(x509.ExtensionOID.KEY_USAGE)
@@ -266,6 +279,7 @@ def get_key_usage(
             ret.append(usage_attr_to_string(attr))
 
     if ext_usage is not None:
+        # pylint: disable=W0212
         ret.extend([e._name for e in ext_usage.value._usages])
 
     return ([beautify_usage_name(e) for e in ret], None)
@@ -290,6 +304,7 @@ def get_ad(
         return None
 
     ret = []
+    # pylint: disable=W0212
     for access_description in authority_info_access.value._descriptions:
         if access_description._access_method == oid:
             ret.append(access_description._access_location.value)
@@ -309,6 +324,7 @@ def get_crl(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
         return None
 
     ret = []
+    # pylint: disable=W0212
     for dp in crl.value._distribution_points:
         for v in dp._full_name:
             ret.append(v.value)
@@ -326,7 +342,7 @@ def get_san(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
 
     ret = []
 
-    for (prefix, type) in [
+    for (prefix, typ) in [
         ("other", OtherName),
         ("mail", RFC822Name),
         ("dns", DNSName),
@@ -335,7 +351,7 @@ def get_san(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
         ("registeredID", RegisteredID),
         ("ip", IPAddress),
     ]:
-        for v in san.value.get_values_for_type(type):
+        for v in san.value.get_values_for_type(typ):
             if isinstance(v, x509.name.Name):
                 v = v.rfc4514_string()
 
@@ -372,19 +388,15 @@ def gen_key_info(pubkey) -> str:
     return "unknown"
 
 
-def get_cert_type(cert: x509.Certificate) -> Optional[str]:
-
-    # TODO implement it
-    return None
-
-
 def get_skid(extensions: x509.extensions.Extensions) -> Optional[str]:
 
     return get_keyid_for_oid(extensions, x509.ExtensionOID.SUBJECT_KEY_IDENTIFIER)
 
 
 def format_keyid(value: bytes) -> str:
-    return "keyid:{}".format("".join("{:02x}".format(b) for b in value))
+    # pylint: disable=consider-using-f-string
+    _key = "".join("{:02x}".format(b) for b in value)
+    return f"keyid: {_key}"
 
 
 def get_akid(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
@@ -401,13 +413,10 @@ def get_akid(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
         ret.append(format_keyid(key.value.key_identifier))
 
     if key.value.authority_cert_issuer is not None:
-        ret.append(
-            "dirname:{}".format(
-                ", ".join(
-                    [e.value.rfc4514_string() for e in key.value.authority_cert_issuer]
-                )
-            )
+        _val = ", ".join(
+            [e.value.rfc4514_string() for e in key.value.authority_cert_issuer]
         )
+        ret.append(f"dirname:{_val}")
 
     if key.value.authority_cert_serial_number is not None:
         ret.append(f"serial:{key.value.authority_cert_serial_number}")
@@ -438,15 +447,23 @@ def format_and_print_fields(fields: List[Tuple[str, Union[str, List[str]]]]):
         if isinstance(field[1], list):
             if len(field[1]) > 0:
                 print(f"{name.ljust(padding)}{field[1][0]}")
-                for e in field[1][1:]:
-                    print(
-                        f"{' '.ljust(len_longuest_field_name + ADDITIONAL_PADDING)}{e}"
-                    )
+                for elm in field[1][1:]:
+                    string = len_longuest_field_name + ADDITIONAL_PADDING
+                    print(f"{' '.ljust(string)}{elm}")
         else:
             print(f"{name.ljust(padding)}{field[1]}")
 
 
-def print_cert(cert: x509.Certificate, timezone="GMT"):
+def get_cert_type(_cert: x509.Certificate) -> Optional[str]:
+    # TODO implement this
+    # type == user, ca ..
+    return None
+
+
+# pylint: disable=too-many-locals
+# pylint: disable=too-many-branches
+def print_cert(cert: x509.Certificate, verbose=False, timezone="GMT"):
+    """Print the content of the certificate"""
     fields: List[Tuple[str, Union[str, List[str]]]] = []
     (valid, nb_sec_to_expiration) = is_cert_valid(
         cert.not_valid_before, cert.not_valid_after
@@ -469,8 +486,7 @@ def print_cert(cert: x509.Certificate, timezone="GMT"):
 
     cert_type = get_cert_type(cert)
 
-    # TODO use full subject if there isn't a CN
-    (cn, warn) = get_cn(cert.subject)
+    (x509_cn, warn) = get_cn(cert.subject)
     warnings.append(warn)
 
     (usages, warn) = get_key_usage(cert.extensions)
@@ -492,20 +508,27 @@ def print_cert(cert: x509.Certificate, timezone="GMT"):
     if signature is not None:
         key_info = f"{key_info} / {signature.name}"
 
-    if cert_type is not None:
+    if verbose and cert_type is not None:
         fields.append(("Type", cert_type))
 
     skid = get_skid(cert.extensions)
     akid = get_akid(cert.extensions)
 
-    fields.append(("CN", colorize(cn, FrontColor.BLUE)))
+    if len(x509_cn) > 0:
+        fields.append(("CN", colorize(x509_cn, FrontColor.BLUE)))
+    else:
+        fields.append(
+            ("Subject", colorize(cert.subject.rfc4514_string(), FrontColor.BLUE))
+        )
     if san is not None:
         fields.append(("SAN", san))
     fields.append(("Issuer", f"{cert.issuer.rfc4514_string()}"))
     fields.append(
         (
             "Validity",
-            f"{validity_to_text(valid)} / {cert.not_valid_before} {timezone} to {cert.not_valid_after} {timezone} ({value} {label} to expiration)",
+            f"{validity_to_text(valid)} / {cert.not_valid_before} {timezone} "
+            f"to {cert.not_valid_after} {timezone} ({value} {label} to "
+            "expiration)",
         )
     )
     fields.append(("Serial", f"{cert.serial_number}"))
@@ -534,16 +557,17 @@ def print_cert(cert: x509.Certificate, timezone="GMT"):
     warnings = list(filter(lambda x: x is not None, warnings))
     if len(warnings) != 0:
         print("\nParsing of certificate generated the following warnings:")
-        for w in warnings:
-            print(f"  {w}")
+        for wrn in warnings:
+            print(f"  {wrn}")
 
 
 @click.command()
 @click.option("--verbose", help="verbose info")
 @click.argument("input_name", default="/dev/stdin")
 def process(verbose, input_name) -> int:
-    input = InputData(input_name)
-    pem_data = input.get_pem()
+    """Process the input parameters and return x509 info"""
+    in_data = InputData(input_name)
+    pem_data = in_data.get_pem()
 
     if pem_data is None:
         sys.exit(-1)
@@ -552,11 +576,13 @@ def process(verbose, input_name) -> int:
     for pem_cert in certs:
         try:
             cert = x509.load_pem_x509_certificate(pem_cert, default_backend())
-        except ValueError as e:
-            print(f"Content of {input} is not a valid PEM encoded certificate")
+        except ValueError as _e:
+            print(
+                f"Content of {input} is not a valid " f"PEM encoded certificate: {_e}"
+            )
             sys.exit(-2)
 
-        print_cert(cert)
+        print_cert(cert, verbose=verbose)
         if len(certs) > 1:
             print("-----")
 
