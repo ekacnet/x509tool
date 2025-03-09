@@ -1,32 +1,23 @@
 #!/usr/bin/env python3
 
 import re
-import sys
 import socket
 import ssl
-from datetime import datetime
-from typing import Tuple, Optional, List, Union
+import sys
+from datetime import UTC, datetime, timezone
 from enum import IntEnum
+from typing import List, Optional, Tuple, Union
 
 import click
 import cryptography
-
-from cryptography.hazmat.backends import default_backend
-from cryptography.x509.general_name import (
-    OtherName,
-    RFC822Name,
-    DNSName,
-    UniformResourceIdentifier,
-    DirectoryName,
-    RegisteredID,
-    IPAddress,
-)
 from cryptography import x509
-
-
-from OpenSSL.crypto import FILETYPE_PEM, dump_certificate
-
+from cryptography.hazmat.backends import default_backend
+from cryptography.x509.general_name import (DirectoryName, DNSName, IPAddress,
+                                            OtherName, RegisteredID,
+                                            RFC822Name,
+                                            UniformResourceIdentifier)
 from OpenSSL import SSL
+from OpenSSL.crypto import FILETYPE_PEM, dump_certificate
 
 
 class InputType(IntEnum):
@@ -226,7 +217,7 @@ def get_expiration(nb_sec: int) -> Tuple[int, str]:
 
 def is_cert_valid(start: datetime, end: datetime) -> Tuple[bool, int]:
     # start and end date in certicate are in PST
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     return (start <= now <= end, int((end - now).total_seconds()))
 
 
@@ -260,11 +251,11 @@ def beautify_usage_name(name: str) -> str:
 
 def get_key_usage(
     extensions: x509.extensions.Extensions,
-) -> Tuple[Optional[List[str]], Optional[str]]:
+) -> Tuple[Optional[List[str]], Optional[str], Optional[x509.extensions.Extension]]:
     try:
         usage = extensions.get_extension_for_oid(x509.ExtensionOID.KEY_USAGE)
     except x509.extensions.ExtensionNotFound:
-        return (None, "No key usages found")
+        return (None, "No key usages found", None)
 
     try:
         ext_usage = extensions.get_extension_for_oid(
@@ -282,26 +273,30 @@ def get_key_usage(
         # pylint: disable=W0212
         ret.extend([e._name for e in ext_usage.value._usages])
 
-    return ([beautify_usage_name(e) for e in ret], None)
+    return ([beautify_usage_name(e) for e in ret], None, usage)
 
 
-def get_ca_issuers(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+def get_ca_issuers(
+    extensions: x509.extensions.Extensions,
+) -> Tuple[Optional[List[str]], x509.extensions.Extension]:
     return get_ad(extensions, x509.AuthorityInformationAccessOID.CA_ISSUERS)
 
 
-def get_ocsp(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+def get_ocsp(
+    extensions: x509.extensions.Extensions,
+) -> Tuple[Optional[List[str]], x509.extensions.Extension]:
     return get_ad(extensions, x509.AuthorityInformationAccessOID.OCSP)
 
 
 def get_ad(
     extensions: x509.extensions.Extensions, oid: x509.oid.AuthorityInformationAccessOID
-) -> Optional[List[str]]:
+) -> Tuple[Optional[List[str]], x509.extensions.Extension]:
     try:
         authority_info_access = extensions.get_extension_for_oid(
             x509.ExtensionOID.AUTHORITY_INFORMATION_ACCESS
         )
     except x509.extensions.ExtensionNotFound:
-        return None
+        return (None, None)
 
     ret = []
     # pylint: disable=W0212
@@ -310,18 +305,20 @@ def get_ad(
             ret.append(access_description._access_location.value)
 
     if len(ret) > 0:
-        return ret
+        return (ret, authority_info_access)
 
-    return None
+    return (None, None)
 
 
-def get_crl(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+def get_crl(
+    extensions: x509.extensions.Extensions,
+) -> Tuple[Optional[List[str]], x509.extensions.Extension]:
     try:
         crl = extensions.get_extension_for_oid(
             x509.ExtensionOID.CRL_DISTRIBUTION_POINTS
         )
     except x509.extensions.ExtensionNotFound:
-        return None
+        return (None, None)
 
     ret = []
     # pylint: disable=W0212
@@ -329,20 +326,22 @@ def get_crl(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
         for v in dp._full_name:
             ret.append(v.value)
 
-    return ret
+    return (ret, crl)
 
 
-def get_san(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+def get_san(
+    extensions: x509.extensions.Extensions,
+) -> Tuple[Optional[List[str]], x509.extensions.Extension]:
     try:
         san = extensions.get_extension_for_oid(
             x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME
         )
     except x509.extensions.ExtensionNotFound:
-        return None
+        return (None, None)
 
     ret = []
 
-    for (prefix, typ) in [
+    for prefix, typ in [
         ("other", OtherName),
         ("mail", RFC822Name),
         ("dns", DNSName),
@@ -360,7 +359,7 @@ def get_san(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
 
             ret.append(f"{prefix}:{v}")
 
-    return ret
+    return (ret, san)
 
 
 def gen_key_info(pubkey) -> str:
@@ -388,7 +387,9 @@ def gen_key_info(pubkey) -> str:
     return "unknown"
 
 
-def get_skid(extensions: x509.extensions.Extensions) -> Optional[str]:
+def get_skid(
+    extensions: x509.extensions.Extensions,
+) -> Tuple[Optional[str], x509.extensions.Extension]:
 
     return get_keyid_for_oid(extensions, x509.ExtensionOID.SUBJECT_KEY_IDENTIFIER)
 
@@ -399,13 +400,15 @@ def format_keyid(value: bytes) -> str:
     return f"keyid: {_key}"
 
 
-def get_akid(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
+def get_akid(
+    extensions: x509.extensions.Extensions,
+) -> Tuple[Optional[List[str]], x509.extensions.Extension]:
 
     oid = x509.ExtensionOID.AUTHORITY_KEY_IDENTIFIER
     try:
         key = extensions.get_extension_for_oid(oid)
     except x509.extensions.ExtensionNotFound:
-        return None
+        return (None, None)
 
     ret = []
 
@@ -422,9 +425,9 @@ def get_akid(extensions: x509.extensions.Extensions) -> Optional[List[str]]:
         ret.append(f"serial:{key.value.authority_cert_serial_number}")
 
     if len(ret) > 0:
-        return ret
+        return (ret, key)
     else:
-        return None
+        return (None, None)
 
 
 def get_keyid_for_oid(
@@ -434,9 +437,9 @@ def get_keyid_for_oid(
     try:
         keyid = extensions.get_extension_for_oid(oid)
     except x509.extensions.ExtensionNotFound:
-        return None
+        return (None, None)
 
-    return format_keyid(keyid.value.digest)
+    return (format_keyid(keyid.value.digest), keyid)
 
 
 def format_and_print_fields(fields: List[Tuple[str, Union[str, List[str]]]]):
@@ -454,20 +457,52 @@ def format_and_print_fields(fields: List[Tuple[str, Union[str, List[str]]]]):
             print(f"{name.ljust(padding)}{field[1]}")
 
 
-def get_cert_type(_cert: x509.Certificate) -> Optional[str]:
-    # TODO implement this
-    # type == user, ca ..
-    return None
+def get_cert_constraints(
+    extensions: x509.extensions.Extensions,
+) -> Tuple[Optional[str], x509.extensions.Extension]:
+    try:
+        constraints = extensions.get_extension_for_oid(
+            x509.ExtensionOID.BASIC_CONSTRAINTS
+        )
+    except x509.extensions.ExtensionNotFound:
+        return (None, None)
+    critical = constraints.critical
+    is_ca = constraints.value.ca
+    path_len = constraints.value.path_length
+
+    return (f"critical = {critical}, is CA = {is_ca}, path length = {path_len}", None)
 
 
 # pylint: disable=too-many-locals
 # pylint: disable=too-many-branches
-def print_cert(cert: x509.Certificate, verbose=False, timezone="GMT"):
+def print_cert(cert: x509.Certificate, verbose=False, tz="UTC"):
     """Print the content of the certificate"""
     fields: List[Tuple[str, Union[str, List[str]]]] = []
-    (valid, nb_sec_to_expiration) = is_cert_valid(
-        cert.not_valid_before, cert.not_valid_after
-    )
+    try:
+        valid_before = cert.not_valid_before_utc()
+        valid_after = cert.not_valid_after_utc()
+    except AttributeError as _e:  # noqa: F
+        valid_before = datetime(
+            cert.not_valid_before.year,
+            cert.not_valid_before.month,
+            cert.not_valid_before.day,
+            cert.not_valid_before.hour,
+            cert.not_valid_before.minute,
+            cert.not_valid_before.second,
+            cert.not_valid_before.microsecond,
+            tzinfo=timezone.utc,
+        )
+        valid_after = datetime(
+            cert.not_valid_after.year,
+            cert.not_valid_after.month,
+            cert.not_valid_after.day,
+            cert.not_valid_after.hour,
+            cert.not_valid_after.minute,
+            cert.not_valid_after.second,
+            cert.not_valid_after.microsecond,
+            tzinfo=timezone.utc,
+        )
+    (valid, nb_sec_to_expiration) = is_cert_valid(valid_before, valid_after)
     (value, label) = get_expiration(nb_sec_to_expiration)
     # type of the cert
     # SAN
@@ -483,22 +518,29 @@ def print_cert(cert: x509.Certificate, verbose=False, timezone="GMT"):
     # SKID
     # AKID
     warnings = []
+    seen_extensions: List[x509.extensions.Extension] = []
+    extensions = cert.extensions
 
-    cert_type = get_cert_type(cert)
+    (cert_constraints, extention) = get_cert_constraints(extensions)
 
     (x509_cn, warn) = get_cn(cert.subject)
     warnings.append(warn)
 
-    (usages, warn) = get_key_usage(cert.extensions)
+    (usages, warn, extention) = get_key_usage(extensions)
+    seen_extensions.append(extention)
     warnings.append(warn)
 
-    crl = get_crl(cert.extensions)
+    (crl, extention) = get_crl(extensions)
+    seen_extensions.append(extention)
 
-    ocsp = get_ocsp(cert.extensions)
+    (ocsp, extention) = get_ocsp(extensions)
+    seen_extensions.append(extention)
 
-    ca_issuers = get_ca_issuers(cert.extensions)
+    (ca_issuers, extention) = get_ca_issuers(extensions)
+    seen_extensions.append(extention)
 
-    san = get_san(cert.extensions)
+    (san, extension) = get_san(extensions)
+    seen_extensions.append(extention)
 
     signature = cert.signature_hash_algorithm
 
@@ -508,11 +550,10 @@ def print_cert(cert: x509.Certificate, verbose=False, timezone="GMT"):
     if signature is not None:
         key_info = f"{key_info} / {signature.name}"
 
-    if verbose and cert_type is not None:
-        fields.append(("Type", cert_type))
-
-    skid = get_skid(cert.extensions)
-    akid = get_akid(cert.extensions)
+    (skid, extension) = get_skid(extensions)
+    seen_extensions.append(extention)
+    (akid, extension) = get_akid(extensions)
+    seen_extensions.append(extention)
 
     if len(x509_cn) > 0:
         fields.append(("CN", colorize(x509_cn, FrontColor.BLUE)))
@@ -526,11 +567,13 @@ def print_cert(cert: x509.Certificate, verbose=False, timezone="GMT"):
     fields.append(
         (
             "Validity",
-            f"{validity_to_text(valid)} / {cert.not_valid_before} {timezone} "
-            f"to {cert.not_valid_after} {timezone} ({value} {label} to "
+            f"{validity_to_text(valid)} / {cert.not_valid_before} {tz} "
+            f"to {cert.not_valid_after} {tz} ({value} {label} to "
             "expiration)",
         )
     )
+    if cert_constraints is not None:
+        fields.append(("Constraints", cert_constraints))
     fields.append(("Serial", f"{cert.serial_number}"))
     if usages is not None:
         fields.append(("Usage", f'{", ".join(usages)}'))
